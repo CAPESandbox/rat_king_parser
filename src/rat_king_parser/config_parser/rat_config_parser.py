@@ -43,6 +43,7 @@ from .utils.decryptors import (
     ConfigDecryptor,
     IncompatibleDecryptorException,
 )
+from .utils.decryptors.config_decryptor_plaintext import KNOWN_CONFIG_FIELD_NAMES
 from .utils.dotnetpe_payload import DotNetPEPayload
 
 logger = getLogger(__name__)
@@ -64,6 +65,7 @@ class RATConfigParser:
         yara_rule: Rules = None,
         data: bytes = None,
         remap_config: bool = False,
+        preserve_obfuscated_keys: bool = False,
     ) -> None:
         self.report = {
             "file_path": file_path,
@@ -74,6 +76,7 @@ class RATConfigParser:
             "config": {},
         }
         self.remap_config = remap_config
+        self.preserve_obfuscated_keys = preserve_obfuscated_keys
         try:
             if data is None and not isfile(file_path):
                 raise ConfigParserException("File not found")
@@ -175,10 +178,32 @@ class RATConfigParser:
             for k in sorted(config_fields_map.keys()):
                 key_name = config_fields_map[k]
                 value = decoded_config[key_name]
+
+                # Run your normalization (e.g. converting HostsFE -> Hosts)
                 key_normalized, value = check_key_n_value(key_name, value)
+
                 if key_normalized != key_name:
                     normalized_fields.append(key_name)
-                sorted_decoded_config[key_normalized] = value
+
+                # --- LOGIC TO APPEND INSTEAD OF OVERWRITE ---
+                if key_normalized in sorted_decoded_config:
+                    existing_val = sorted_decoded_config[key_normalized]
+
+                    # Case 1: Values are Strings (e.g. "1.2.3.4:80")
+                    if isinstance(existing_val, str) and value:
+                        # Append with a comma separator
+                        sorted_decoded_config[key_normalized] = f"{existing_val},{value}"
+
+                    # Case 2: Values are Lists (e.g. ["1.2.3.4:80"])
+                    elif isinstance(existing_val, list):
+                        # If the new value is also a list, extend; otherwise append
+                        if isinstance(value, list):
+                            sorted_decoded_config[key_normalized] = existing_val + value
+                        else:
+                            sorted_decoded_config[key_normalized].append(value)
+                else:
+                    # Key does not exist yet, create it
+                    sorted_decoded_config[key_normalized] = value
             # Ensure config items added by decryptors dynamically are preserved
             sorted_decoded_config.update(
                 {
@@ -205,6 +230,17 @@ class RATConfigParser:
             except Exception as e:
                 raise ConfigParserException(f"Could not identify config: {e}")
         logger.debug(f"Config found at RVA {hex(config_start)}...")
+        if not self.preserve_obfuscated_keys and self._is_likely_obfuscated_config(
+            decrypted_config
+        ):
+            logger.debug(
+                "Preserve keys set to False and possible obfuscation detected; Translating keys..."
+            )
+            decrypted_config = {
+                f"obfuscated_key_{idx}": v
+                for idx, (_, v) in enumerate(decrypted_config.items(), 1)
+            }
+
         return decrypted_config
 
     # Attempts to retrieve the config via brute-force, looking through every
@@ -278,3 +314,11 @@ class RATConfigParser:
                 if min_config_len < self._MIN_CONFIG_LEN_FLOOR:
                     raise e
                 min_config_len -= 1
+
+    def _is_likely_obfuscated_config(self, config: dict[str, Any]) -> bool:
+        for key in config.keys():
+            if not key.isascii():
+                return True
+            if key in KNOWN_CONFIG_FIELD_NAMES:
+                return False
+        return True
